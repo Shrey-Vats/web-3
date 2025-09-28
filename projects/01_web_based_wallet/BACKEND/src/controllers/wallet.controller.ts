@@ -3,43 +3,36 @@ import { generateUsername } from "unique-username-generator";
 import prisma from "../utils/db.js";
 import { ethers } from "ethers";
 import jwt, { type JwtPayload } from "jsonwebtoken";
-import { stringify } from "querystring";
 
-interface userPayload extends JwtPayload {
-  id: string;
+interface UserPayload extends JwtPayload {
+  userId: string;
   name: string;
 }
+
+const SECRET = process.env.SECRET || "shrey";
+
 
 export const createRandomUser = async (req: Request, res: Response) => {
   try {
     const name = generateUsername();
 
     const user = await prisma.user.create({
-      data: {
-        name,
-      },
+      data: { name },
     });
 
     const token = jwt.sign(
-      {
-        userId: user.id,
-        name: user.name,
-      },
-      process.env.SECRET || "shrey"
+      { userId: user.id, name: user.name },
+      SECRET
     );
 
     res.setHeader("Authorization", `Bearer ${token}`);
-
-    res.status(200).json({
+    return res.status(201).json({
       message: "User created successfully",
-      name,
-      user,
+      token,
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({
-      message: "Error on creating user",
-    });
+    return res.status(500).json({ message: "Error creating user" });
   }
 };
 
@@ -47,46 +40,31 @@ export const createWallet = async (req: Request, res: Response) => {
   try {
     const { message } = req.body || {};
     const authHeader = req.headers["authorization"];
-    const secret = process.env.SECRET || "shrey";
-
     const token = authHeader?.split(" ")[1];
-    if (!token) return res.status(404).json({ message: "token not found" });
 
-    const user = jwt.verify(token, secret) as JwtPayload;
-    if (!user) return res.status(400).json({ message: "Unauthorize" });
+    if (!token) return res.status(401).json({ message: "Token not found" });
+
+    const user = jwt.verify(token, SECRET) as UserPayload;
+    if (!user) return res.status(403).json({ message: "Unauthorized" });
 
     const wallet = ethers.Wallet.createRandom();
-    const publicKey = wallet.address;
-    const privateKey = wallet.privateKey;
+    const { address: publicKey, privateKey } = wallet;
 
-    const signature = await wallet.signMessage(
-      message !== undefined ? message : ""
-    );
+    const signature = await wallet.signMessage(message || "");
 
-    const wallets = await prisma.wallet.create({
+    const dbWallet = await prisma.wallet.create({
+      data: { privateKey, publicKey, userId: user.userId },
+    });
+
+    await prisma.signature.create({
       data: {
-        privateKey,
-        publicKey,
-        userId: (user as userPayload).userId,
+        walletId: dbWallet.id,
+        signatureKey: signature,
+        message: message || "",
       },
     });
 
-    const data: {
-      walletId: string;
-      signatureKey: string;
-      message?: string;
-    } = {
-      walletId: wallets.id,
-      signatureKey: signature,
-    };
-
-    if (message) data["message"] = message;
-
-    await prisma.signature.create({
-      data,
-    });
-
-    res.status(200).json({
+    return res.status(201).json({
       privateKey,
       publicKey,
       signature,
@@ -94,98 +72,92 @@ export const createWallet = async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({
-      message: "Internal server error",
-    });
+    return res.status(500).json({ message: "Internal server error" });
   }
 };
 
 export const getAllWallets = async (req: Request, res: Response) => {
   try {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader?.split(" ")[1];
+
+    if (!token) return res.status(401).json({ message: "Token not found" });
+
+    const user = jwt.verify(token, SECRET) as UserPayload;
+    if (!user) return res.status(403).json({ message: "Unauthorized" });
+
     const wallets = await prisma.wallet.findMany({
-      include: {
-        signature: {
-          select: {
-            signatureKey: true,
-            message: true,
-          },
-        },
-      },
+      where: { userId: user.userId },
+      include: { signature: true },
     });
-    res.status(200).json({ message: "successfuly send", data: wallets });
+
+    return res.status(200).json({
+      message: "Wallets fetched successfully",
+      success: true,
+      data: wallets.map((w) => ({
+        id: w.id,
+        publicKey: w.publicKey,
+        secretKey: w.privateKey,
+        secretPhrase: w.signature.map((s) => s.signatureKey).join(", "),
+      })),
+    });
   } catch (error) {
-    res.status(500).json({
-      message: "Internal server error",
-    });
+    console.error(error);
+    return res.status(500).json({ message: "Internal server error", success: false });
   }
 };
 
 export const deleteWallet = async (req: Request, res: Response) => {
   try {
     const { walletId } = req.params;
+    if (!walletId) return res.status(400).json({ message: "Wallet ID is required" });
 
-    if (!walletId)
-      return res.status(400).json({ message: "wallet id is required" });
+    const existingWallet = await prisma.wallet.findUnique({ where: { id: walletId } });
+    if (!existingWallet) return res.status(404).json({ message: "Wallet not found" });
 
-    const existingWallet = await prisma.wallet.findUnique({
-      where: {
-        id: walletId,
-      },
-    });
-    if (!existingWallet)
-      return res.status(404).json({ message: "wallet not found" });
+    await prisma.signature.deleteMany({ where: { walletId } });
+    const deletedWallet = await prisma.wallet.delete({ where: { id: walletId } });
 
-    await prisma.signature.deleteMany({
-      where: {
-        walletId: walletId,
-      },
-    });
-
-    const wallet = await prisma.wallet.delete({
-      where: {
-        id: walletId,
-      },
-    });
-
-    res
-      .status(200)
-      .json({ message: "wallet deleted successfuly", data: wallet });
+    return res.status(200).json({ message: "Wallet deleted successfully", data: deletedWallet });
   } catch (error) {
     console.error(error);
-    res.status(500).json({
-      message: "Internal server error",
-    });
+    return res.status(500).json({ message: "Internal server error" });
   }
 };
 
 export const deleteSignature = async (req: Request, res: Response) => {
   try {
     const { signatureId } = req.params;
+    if (!signatureId) return res.status(400).json({ message: "Signature ID is required" });
 
-    if (!signatureId)
-      return res.status(400).json({ message: "signature id is required" });
+    const existingSignature = await prisma.signature.findUnique({ where: { id: signatureId } });
+    if (!existingSignature) return res.status(404).json({ message: "Signature not found" });
 
-    const existingSignature = await prisma.signature.findUnique({
-      where: {
-        id: signatureId,
-      },
-    });
-    if (!existingSignature)
-      return res.status(404).json({ message: "signature not found" });
+    await prisma.signature.delete({ where: { id: signatureId } });
 
-    await prisma.signature.delete({
-      where: {
-        id: signatureId,
-      },
-    });
-
-    res
-      .status(200)
-      .json({ message: "signature deleted successfuly", data: existingSignature });
+    return res.status(200).json({ message: "Signature deleted successfully", data: existingSignature });
   } catch (error) {
     console.error(error);
-    res.status(500).json({
-      message: "Internal server error",
+    return res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+export const getAllSignaturesOfUser = async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader?.split(" ")[1];
+    if (!token) return res.status(401).json({ message: "Token not found" });
+
+    const user = jwt.verify(token, SECRET) as UserPayload;
+    if (!user) return res.status(403).json({ message: "Unauthorized" });
+
+    const signatures = await prisma.signature.findMany({
+      where: { wallet: { userId: user.userId } },
     });
+
+    return res.status(200).json({ message: "Signatures fetched successfully", data: signatures, success: true });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Internal server error" });
   }
 };

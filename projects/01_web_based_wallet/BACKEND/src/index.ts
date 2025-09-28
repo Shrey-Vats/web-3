@@ -1,9 +1,13 @@
 import e from "express";
 import { createRandomUser, createWallet, deleteSignature, deleteWallet, getAllWallets } from "./controllers/wallet.controller.js";
+import dotenv from "dotenv";
+import cors from "cors";
 
+dotenv.config();
 const app = e();
 
 app.use(e.json());
+app.use(cors());
 
 app.get("/", getAllWallets);
 app.get("/user", createRandomUser);
